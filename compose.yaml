@@ -1,0 +1,8 @@
+services:
+  engine:
+    build: .
+    ports:
+      - "8080:8080"
+    environment:
+      - ENGINE_ADDR=:8080
+
