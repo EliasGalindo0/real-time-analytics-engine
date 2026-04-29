@@ -44,7 +44,7 @@ func main() {
 		Outbound: h,
 	})
 	processor.Start()
-	defer processor.Stop()
+	defer processor.Cancel()
 
 	mux := http.NewServeMux()
 	api := httpapi.New(httpapi.Config{
@@ -77,9 +77,28 @@ func main() {
 	}()
 
 	waitForSignal()
+
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	_ = srv.Shutdown(ctx)
+
+	// Stop accepting new events, then drain buffered events.
+	close(ingestQ)
+
+	drainDeadline := time.NewTimer(5 * time.Second)
+	defer drainDeadline.Stop()
+	done := make(chan struct{})
+	go func() {
+		processor.Wait()
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-drainDeadline.C:
+		logger.Warn("drain timeout; cancelling processor")
+		processor.Cancel()
+		processor.Wait()
+	}
 }
 
 func env(key, fallback string) string {

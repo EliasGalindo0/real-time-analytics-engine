@@ -43,10 +43,9 @@ func (p *Processor) Start() {
 	}
 }
 
-func (p *Processor) Stop() {
-	p.cancel()
-	p.wg.Wait()
-}
+func (p *Processor) Cancel() { p.cancel() }
+
+func (p *Processor) Wait() { p.wg.Wait() }
 
 func (p *Processor) worker() {
 	defer p.wg.Done()

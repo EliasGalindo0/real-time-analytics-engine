@@ -67,4 +67,10 @@ curl -sS http://localhost:8080/metrics
 curl -sS http://localhost:8080/stats
 ```
 
+## Readiness (load balancers / autoscaling)
+
+```bash
+curl -sS -i http://localhost:8080/readyz
+```
+
 # real-time-analytics-engine

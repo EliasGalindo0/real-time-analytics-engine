@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"net/http"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/gorilla/websocket"
@@ -31,6 +32,11 @@ type API struct {
 	cfg Config
 
 	upgrader websocket.Upgrader
+
+	accepted         uint64
+	rejected         uint64
+	overloaded       uint64
+	capacityRejected uint64
 }
 
 func New(cfg Config) *API {
@@ -54,6 +60,7 @@ func New(cfg Config) *API {
 
 func (a *API) Register(mux *http.ServeMux) {
 	mux.HandleFunc("GET /healthz", a.healthz)
+	mux.HandleFunc("GET /readyz", a.readyz)
 	mux.HandleFunc("POST /ingest", a.ingest)
 	mux.HandleFunc("GET /metrics", a.metrics)
 	mux.HandleFunc("GET /stats", a.stats)
@@ -63,6 +70,21 @@ func (a *API) Register(mux *http.ServeMux) {
 func (a *API) healthz(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusOK)
 	_, _ = w.Write([]byte("ok"))
+}
+
+func (a *API) readyz(w http.ResponseWriter, r *http.Request) {
+	if cap(a.cfg.IngestQ) > 0 {
+		if float64(len(a.cfg.IngestQ))/float64(cap(a.cfg.IngestQ)) >= 0.90 {
+			writeErr(w, http.StatusServiceUnavailable, "not_ready", "ingest queue is near capacity")
+			return
+		}
+	}
+	if a.cfg.Store.AtCapacity() {
+		writeErr(w, http.StatusServiceUnavailable, "not_ready", "series capacity reached")
+		return
+	}
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write([]byte("ready"))
 }
 
 type ingestReq struct {
@@ -110,6 +132,11 @@ func (a *API) ingest(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		accepted, rejected, overloaded := a.enqueueBatch(batch)
+		atomic.AddUint64(&a.accepted, uint64(accepted))
+		atomic.AddUint64(&a.rejected, uint64(rejected))
+		if overloaded {
+			atomic.AddUint64(&a.overloaded, 1)
+		}
 		status := http.StatusAccepted
 		if overloaded {
 			status = http.StatusTooManyRequests
@@ -129,13 +156,21 @@ func (a *API) ingest(w http.ResponseWriter, r *http.Request) {
 	}
 	e, err := toEvent(req)
 	if err != nil {
+		atomic.AddUint64(&a.rejected, 1)
 		writeErr(w, http.StatusBadRequest, "invalid_event", err.Error())
 		return
 	}
+	if !a.admit(e) {
+		atomic.AddUint64(&a.capacityRejected, 1)
+		writeErr(w, http.StatusServiceUnavailable, "capacity_reached", "series capacity reached (new series rejected)")
+		return
+	}
 	if ok := tryEnqueue(a.cfg.IngestQ, e); !ok {
+		atomic.AddUint64(&a.overloaded, 1)
 		writeErr(w, http.StatusTooManyRequests, "ingest_overloaded", "ingest queue is full")
 		return
 	}
+	atomic.AddUint64(&a.accepted, 1)
 	w.WriteHeader(http.StatusAccepted)
 	_, _ = w.Write([]byte("accepted"))
 }
@@ -150,12 +185,19 @@ func (a *API) metrics(w http.ResponseWriter, r *http.Request) {
 func (a *API) stats(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{
 		"uptime_sec": int64(time.Since(a.cfg.StartTime).Seconds()),
+		"counters": map[string]any{
+			"accepted":          atomic.LoadUint64(&a.accepted),
+			"rejected":          atomic.LoadUint64(&a.rejected),
+			"overloaded":        atomic.LoadUint64(&a.overloaded),
+			"capacity_rejected": atomic.LoadUint64(&a.capacityRejected),
+		},
 		"ingest_q": map[string]any{
 			"len": len(a.cfg.IngestQ),
 			"cap": cap(a.cfg.IngestQ),
 		},
 		"store": map[string]any{
-			"series": a.cfg.Store.Len(),
+			"series":      a.cfg.Store.Len(),
+			"at_capacity": a.cfg.Store.AtCapacity(),
 		},
 		"hub": a.cfg.Hub.Stats(),
 	})
@@ -288,6 +330,11 @@ func (a *API) enqueueBatch(batch []ingestReq) (accepted int, rejected int, overl
 			rejected++
 			continue
 		}
+		if !a.admit(e) {
+			rejected++
+			atomic.AddUint64(&a.capacityRejected, 1)
+			continue
+		}
 		if ok := tryEnqueue(a.cfg.IngestQ, e); !ok {
 			overloaded = true
 			break
@@ -295,5 +342,13 @@ func (a *API) enqueueBatch(batch []ingestReq) (accepted int, rejected int, overl
 		accepted++
 	}
 	return accepted, rejected, overloaded
+}
+
+func (a *API) admit(e aggregate.Event) bool {
+	if !a.cfg.Store.AtCapacity() {
+		return true
+	}
+	key := aggregate.MakeSeriesKey(e.Name, e.Tags)
+	return a.cfg.Store.HasSeries(key)
 }
 

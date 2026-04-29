@@ -111,6 +111,19 @@ func (s *Store) Len() int {
 	return len(s.series)
 }
 
+func (s *Store) AtCapacity() bool {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return len(s.series) >= s.cfg.MaxSeries
+}
+
+func (s *Store) HasSeries(key SeriesKey) bool {
+	s.mu.RLock()
+	_, ok := s.series[key]
+	s.mu.RUnlock()
+	return ok
+}
+
 func cloneTags(in map[string]string) map[string]string {
 	if len(in) == 0 {
 		return nil
