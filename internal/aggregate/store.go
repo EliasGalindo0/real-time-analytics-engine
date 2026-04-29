@@ -105,6 +105,12 @@ func (s *Store) Snapshot(limit int) []SeriesAgg {
 	return out
 }
 
+func (s *Store) Len() int {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return len(s.series)
+}
+
 func cloneTags(in map[string]string) map[string]string {
 	if len(in) == 0 {
 		return nil

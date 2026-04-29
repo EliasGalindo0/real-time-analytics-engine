@@ -2,6 +2,7 @@ package hub
 
 import (
 	"encoding/json"
+	"strconv"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -24,6 +25,8 @@ type Hub struct {
 	timer      *time.Timer
 
 	closed atomic.Bool
+
+	dropped uint64
 }
 
 func New(cfg Config) *Hub {
@@ -82,6 +85,25 @@ func (h *Hub) Remove(c *Client) {
 	h.mu.Unlock()
 }
 
+type Stats struct {
+	Clients int    `json:"clients"`
+	Dropped uint64 `json:"dropped"`
+}
+
+func (h *Hub) Stats() Stats {
+	h.mu.RLock()
+	n := len(h.clients)
+	h.mu.RUnlock()
+	return Stats{
+		Clients: n,
+		Dropped: atomic.LoadUint64(&h.dropped),
+	}
+}
+
+func (h *Hub) ClientQueueDepth() int {
+	return h.cfg.PerClientQueueDepth
+}
+
 func (h *Hub) Publish(v any) {
 	if h.closed.Load() {
 		return
@@ -123,7 +145,9 @@ func (h *Hub) flush() {
 
 	for _, msg := range pending {
 		for _, c := range clients {
-			c.TrySend(msg)
+			if ok := c.TrySend(msg); !ok {
+				atomic.AddUint64(&h.dropped, 1)
+			}
 		}
 	}
 }
@@ -148,6 +172,6 @@ func extractKey(b []byte) string {
 			}
 		}
 	}
-	return string(time.Now().UnixNano())
+	return strconv.FormatInt(time.Now().UnixNano(), 10)
 }
 
